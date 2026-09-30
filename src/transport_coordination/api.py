@@ -9,6 +9,7 @@ from typing import Any
 from urllib.parse import parse_qs, urlparse
 
 from .errors import DomainError, ValidationError
+from .public import PublicService
 from .service import DomainService
 from .storage import Database
 
@@ -20,7 +21,9 @@ def route(service: DomainService, method: str, path: str, body: dict[str, Any] |
     headers = headers or {}
     body = body or {}
     parsed = urlparse(path)
+    query = parse_qs(parsed.query)
     actor_id = headers.get("X-Actor-Id", "")
+    public = PublicService(service.database, service.clock)
     try:
         if method == "GET" and parsed.path == "/health":
             valid, count = service.verify_audit()
@@ -38,21 +41,101 @@ def route(service: DomainService, method: str, path: str, body: dict[str, Any] |
             receipt = service.record_domain_data(actor_id=actor_id, **body)
             return 200 if receipt.replayed else 201, receipt.__dict__
         if method == "GET" and parsed.path == "/domain-records":
-            query = parse_qs(parsed.query)
             site_id = query.get("site_id", [""])[0]
             if not site_id:
                 raise ValidationError("site_id 不能为空")
             category = query.get("category", [None])[0]
             return 200, {"items": [item.__dict__ for item in service.list_domain_data(site_id, category)]}
         if method == "GET" and parsed.path == "/audit-events":
-            query = parse_qs(parsed.query)
             after = int(query.get("after_sequence", ["0"])[0])
             return 200, {"items": service.audit_events(after)}
+
+        status, payload = _public_route(public, method, parsed.path, query, body, actor_id)
+        if status is not None:
+            return status, payload
         return 404, {"error": "route_not_found", "message": "接口不存在"}
     except DomainError as exc:
         return exc.status, {"error": exc.code, "message": str(exc)}
     except (TypeError, ValueError) as exc:
         return 400, {"error": "invalid_request", "message": str(exc)}
+
+
+def _public_route(public: PublicService, method: str, path: str,
+                  query: dict[str, list[str]], body: dict[str, Any],
+                  actor_id: str) -> tuple[int | None, dict[str, Any]]:
+    """分派公共服务运行图相关接口。"""
+
+    def write(receipt) -> tuple[int, dict[str, Any]]:
+        return (200 if receipt.replayed else 201), receipt.__dict__
+
+    if method == "POST":
+        if path == "/public/stations":
+            return write(public.register_station(actor_id=actor_id, **body))
+        if path == "/public/calendars":
+            return write(public.register_calendar(actor_id=actor_id, **body))
+        if path == "/public/agreements":
+            return write(public.register_agreement(actor_id=actor_id, **body))
+        if path == "/public/commitments":
+            return write(public.register_commitment(actor_id=actor_id, **body))
+        if path == "/public/plans":
+            return write(public.create_plan(actor_id=actor_id, **body))
+        if path == "/public/plans/confirm":
+            return write(public.confirm_plan(actor_id=actor_id, **body))
+        if path == "/public/trains":
+            return write(public.add_train(actor_id=actor_id, **body))
+        if path == "/public/blocks":
+            return write(public.register_block(actor_id=actor_id, **body))
+        if path == "/public/disasters":
+            return write(public.register_disaster(actor_id=actor_id, **body))
+        if path == "/public/consignments":
+            return write(public.accept_consignment(actor_id=actor_id, **body))
+        if path == "/public/consignments/carried":
+            return write(public.mark_consignment_carried(actor_id=actor_id, **body))
+        if path == "/public/amendments/add-stop":
+            return write(public.add_stop(actor_id=actor_id, **body))
+        if path == "/public/amendments/skip-stop":
+            return write(public.skip_stop(actor_id=actor_id, **body))
+        if path == "/public/amendments/cancel-train":
+            return write(public.cancel_train(actor_id=actor_id, **body))
+        if path == "/public/amendments/restore":
+            return write(public.restore_service(actor_id=actor_id, **body))
+        if path == "/public/replacements":
+            return write(public.arrange_replacement(actor_id=actor_id, **body))
+        if path == "/public/rounds":
+            return write(public.open_round(actor_id=actor_id, **body))
+        if path == "/public/rounds/freeze":
+            return write(public.freeze_round(actor_id=actor_id, **body))
+        if path == "/public/ridership":
+            return write(public.submit_ridership(actor_id=actor_id, **body))
+    if method == "GET":
+        if path == "/public/day-report":
+            site_id = query.get("site_id", [""])[0]
+            day = query.get("date", [""])[0]
+            if not site_id or not day:
+                raise ValidationError("site_id 与 date 不能为空")
+            return 200, public.day_report(site_id, day, actor_id or None)
+        if path == "/public/plan-for-date":
+            site_id = query.get("site_id", [""])[0]
+            day = query.get("date", [""])[0]
+            if not site_id or not day:
+                raise ValidationError("site_id 与 date 不能为空")
+            return 200, public.plan_for_date(site_id, day)
+        if path == "/public/snapshot":
+            plan_id = query.get("plan_id", [""])[0]
+            if not plan_id:
+                raise ValidationError("plan_id 不能为空")
+            return 200, public.plan_snapshot(plan_id)
+        if path == "/public/amendments":
+            plan_id = query.get("plan_id", [""])[0]
+            if not plan_id:
+                raise ValidationError("plan_id 不能为空")
+            return 200, {"items": public.list_amendments(plan_id)}
+        if path == "/public/round-evidence":
+            round_id = query.get("round_id", [""])[0]
+            if not round_id:
+                raise ValidationError("round_id 不能为空")
+            return 200, public.round_evidence(round_id)
+    return None, {}
 
 
 class Handler(BaseHTTPRequestHandler):
